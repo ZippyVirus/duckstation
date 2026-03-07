@@ -27,6 +27,7 @@
 #include "host.h"
 #include "imgui_overlays.h"
 #include "interrupt_controller.h"
+#include "mcp_server.h"
 #include "mdec.h"
 #include "memory_card.h"
 #include "multitap.h"
@@ -1607,6 +1608,10 @@ void System::PauseSystem(bool paused)
 
     GDBServer::OnSystemPaused();
 
+#ifdef ENABLE_MCP_SERVER
+    MCPServer::OnSystemPaused();
+#endif
+
     Host::OnSystemPaused();
     UpdateDisplayVSync();
     VideoThread::PresentCurrentFrame();
@@ -1621,6 +1626,10 @@ void System::PauseSystem(bool paused)
       InhibitScreensaver(true);
 
     GDBServer::OnSystemResumed();
+
+#ifdef ENABLE_MCP_SERVER
+    MCPServer::OnSystemResumed();
+#endif
 
     Host::OnSystemResumed();
     UpdateDisplayVSync();
@@ -2157,6 +2166,10 @@ void System::FrameDone()
   DiscordPresence::Poll();
 
   GDBServer::PollUntil(0);
+
+#ifdef ENABLE_MCP_SERVER
+  MCPServer::OnFrameEnd();
+#endif
 
   // Save states for rewind and runahead.
   if (s_state.rewind_save_counter >= 0)
@@ -4870,6 +4883,16 @@ void System::CheckForSettingsChanges(const Settings& old_settings)
       }
     }
   }
+
+#ifdef ENABLE_MCP_SERVER
+  if (g_settings.enable_mcp_server != old_settings.enable_mcp_server ||
+      g_settings.mcp_server_port != old_settings.mcp_server_port)
+  {
+    MCPServer::Shutdown();
+    if (g_settings.enable_mcp_server)
+      MCPServer::Initialize(g_settings.mcp_server_port);
+  }
+#endif
 
   if (g_settings.disable_background_input != old_settings.disable_background_input)
     InputManager::UpdateInputIgnoreState();

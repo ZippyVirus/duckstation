@@ -406,6 +406,8 @@ struct Settings : public GPUSettings
 
   u16 gdb_server_port = DEFAULT_GDB_SERVER_PORT;
   bool enable_gdb_server = false;
+  u16 mcp_server_port = DEFAULT_MCP_SERVER_PORT;
+  bool enable_mcp_server = false;
 
   ALWAYS_INLINE bool IsRunaheadEnabled() const { return (runahead_frames > 0); }
 
@@ -647,6 +649,7 @@ struct Settings : public GPUSettings
   static constexpr bool DEFAULT_FAST_BOOT_VALUE = false;
   static constexpr u16 DEFAULT_GDB_SERVER_PORT = 2345;
   static constexpr bool DEFAULT_ACHIEVEMENT_BADGE_PREFETCH = true;
+  static constexpr u16 DEFAULT_MCP_SERVER_PORT = 2346;
 };
 
 ALIGN_TO_CACHE_LINE extern Settings g_settings;        // CPU thread copy.

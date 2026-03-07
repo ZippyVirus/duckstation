@@ -67,6 +67,8 @@ add_library(core
   game_list.h
   gdb_server.cpp
   gdb_server.h
+  mcp_server.cpp
+  mcp_server.h
   gpu.cpp
   gpu.h
   gpu_backend.cpp

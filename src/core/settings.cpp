@@ -575,6 +575,8 @@ void Settings::Load(const SettingsInterface& si, const SettingsInterface& contro
 
   enable_gdb_server = si.GetBoolValue("Debug", "EnableGDBServer");
   gdb_server_port = static_cast<u16>(si.GetUIntValue("Debug", "GDBServerPort", DEFAULT_GDB_SERVER_PORT));
+  enable_mcp_server = si.GetBoolValue("Debug", "EnableMCPServer");
+  mcp_server_port = static_cast<u16>(si.GetUIntValue("Debug", "MCPServerPort", DEFAULT_MCP_SERVER_PORT));
 
   sio_redirect_to_tty = si.GetBoolValue("SIO", "RedirectToTTY", false);
 
@@ -915,6 +917,8 @@ void Settings::Save(SettingsInterface& si, bool for_copy) const
 
     si.SetBoolValue("Debug", "EnableGDBServer", enable_gdb_server);
     si.SetUIntValue("Debug", "GDBServerPort", gdb_server_port);
+    si.SetBoolValue("Debug", "EnableMCPServer", enable_mcp_server);
+    si.SetUIntValue("Debug", "MCPServerPort", mcp_server_port);
 
     si.SetBoolValue("SIO", "RedirectToTTY", sio_redirect_to_tty);
 
@@ -1203,6 +1207,7 @@ void Settings::ApplySettingRestrictions()
     }
 
     enable_gdb_server = false;
+    enable_mcp_server = false;
 
     gpu_show_vram = false;
     gpu_dump_cpu_to_vram_copies = false;
