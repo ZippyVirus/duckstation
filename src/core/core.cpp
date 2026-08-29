@@ -832,4 +832,8 @@ void Core::IdleUpdate(u64 max_poll_time)
   Achievements::IdleUpdate();
 
   GDBServer::PollUntil(max_poll_time);
+
+#ifdef ENABLE_MCP_SERVER
+  MCPServer::PollUntil(max_poll_time);
+#endif
 }

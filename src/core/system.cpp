@@ -2168,6 +2168,10 @@ void System::FrameDone()
   GDBServer::PollUntil(0);
 
 #ifdef ENABLE_MCP_SERVER
+  // The core thread never goes idle while a game runs, so the idle-loop poll in
+  // Core::IdleUpdate() does not run. Without this the listen socket is open and
+  // silent: connections are accepted but nothing is ever read.
+  MCPServer::PollUntil(0);
   MCPServer::OnFrameEnd();
 #endif
 
