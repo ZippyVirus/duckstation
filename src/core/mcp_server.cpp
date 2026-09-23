@@ -51,6 +51,7 @@
 #include "common/log.h"
 #include "common/small_string.h"
 #include "common/string_util.h"
+#include "common/timer.h"
 
 #include "util/media_capture.h"
 #include "util/sockets.h"
@@ -118,6 +119,34 @@ static constexpr int MCP_ERR_SYSTEM_NOT_RUNNING = -32001;
 static constexpr int MCP_ERR_OPERATION_FAILED = -32002;
 static constexpr int MCP_ERR_PRECONDITION_FAILED = -32003;
 
+/// Error codes defined by MCP 2026-07-28 in the sub-range the spec reserves for itself
+/// (-32020 to -32099). Both are sent with HTTP 400.
+static constexpr int MCP_ERR_HEADER_MISMATCH = -32020;
+static constexpr int MCP_ERR_UNSUPPORTED_PROTOCOL_VERSION = -32022;
+
+/// Protocol revisions we speak, newest first. Modern revisions (2026-07-28 and later) are
+/// stateless: every request carries its version in _meta and in the MCP-Protocol-Version
+/// header, and there is no handshake. Legacy revisions negotiate the version once through
+/// initialize and bind it to a session. Both eras are served on the same endpoint.
+static constexpr const char* MODERN_PROTOCOL_VERSIONS[] = {"2026-07-28"};
+static constexpr const char* LEGACY_PROTOCOL_VERSIONS[] = {"2025-11-25", "2025-06-18", "2025-03-26"};
+
+/// Reserved per-request/per-result _meta keys (2026-07-28).
+static constexpr const char* META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion";
+static constexpr const char* META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities";
+static constexpr const char* META_SERVER_INFO = "io.modelcontextprotocol/serverInfo";
+static constexpr const char* META_SUBSCRIPTION_ID = "io.modelcontextprotocol/subscriptionId";
+
+static constexpr const char* SERVER_NAME = "duckstation-mcp";
+static constexpr const char* SERVER_VERSION = "1.1.0";
+
+/// Freshness hint for results that only change when the binary does (tool, prompt and
+/// resource lists, server/discover). Kept short so a rebuilt emulator is picked up quickly.
+static constexpr u32 STATIC_RESULT_TTL_MS = 5 * 60 * 1000;
+
+/// Interval between SSE keep-alive comments on idle subscriptions/listen streams.
+static constexpr u64 LISTEN_KEEPALIVE_INTERVAL_SECONDS = 15;
+
 /// Optional Bearer token for authentication. Empty = no auth required.
 static std::string s_auth_token;
 
@@ -141,8 +170,32 @@ static std::string s_cors_origin;
 /// Active MCP session ID (crypto-secure, assigned on initialize).
 static std::string s_mcp_session_id;
 
-/// Negotiated protocol version for the current session.
+/// Negotiated protocol version for the current (legacy, initialize-based) session.
 static std::string s_negotiated_protocol_version;
+
+static bool IsModernProtocolVersion(std::string_view version)
+{
+  return std::any_of(std::begin(MODERN_PROTOCOL_VERSIONS), std::end(MODERN_PROTOCOL_VERSIONS),
+                     [version](const char* v) { return version == v; });
+}
+
+static bool IsLegacyProtocolVersion(std::string_view version)
+{
+  return std::any_of(std::begin(LEGACY_PROTOCOL_VERSIONS), std::end(LEGACY_PROTOCOL_VERSIONS),
+                     [version](const char* v) { return version == v; });
+}
+
+/// Writes every version we accept, modern first. Legacy versions are listed too: a dual-era
+/// client that picks one of them knows to fall back to the initialize handshake.
+static void WriteSupportedProtocolVersions(JsonWriter& w)
+{
+  w.StartArray();
+  for (const char* v : MODERN_PROTOCOL_VERSIONS)
+    w.String(v);
+  for (const char* v : LEGACY_PROTOCOL_VERSIONS)
+    w.String(v);
+  w.EndArray();
+}
 
 // ---- SSE replay buffer (Last-Event-ID resume per MCP 2025-11-25 §2.2) ----
 
@@ -184,6 +237,15 @@ public:
   /// retained event (gap — client missed events that fell out of the ring buffer).
   int ReplaySSEEventsFrom(u64 last_event_id);
 
+  /// subscriptions/listen stream (2026-07-28): a POST whose response stays open as an SSE
+  /// stream of the notifications the client opted in to.
+  bool IsListening() const { return m_is_listen; }
+  bool IsListeningToResource(std::string_view uri) const;
+  void SendListenNotification(std::string_view method, std::string_view params_fields);
+  void SendListenKeepAlive();
+  /// Graceful end of the subscription: answer the listen request, then close the stream.
+  void CloseListenStream();
+
 protected:
   void OnConnected() override;
   void OnDisconnected(const Error& error) override;
@@ -198,8 +260,18 @@ private:
   void SendHttpResponseDirect(int status_code, std::string_view content_type, std::string_view body,
                               std::string_view extra_headers = {});
 
-  static std::string MakeJsonRpcResponse(const JsonValue& id, std::string_view result_json);
+  /// Validates the per-request metadata of a modern (2026-07-28) request and sends the
+  /// error response itself when it is invalid. Returns true if the request may proceed.
+  bool ValidateModernRequest(const JsonValue& id, std::string_view method, const JsonValue& params);
+  void StartListenStream(const JsonValue& id, const JsonValue& params);
+
+  /// Result responses for modern requests also carry resultType, serverInfo and, for
+  /// cacheable methods, the caching hints (see m_request_cache).
+  std::string MakeJsonRpcResponse(const JsonValue& id, std::string_view result_json) const;
   static std::string MakeJsonRpcError(const JsonValue& id, int code, std::string_view message);
+  static std::string MakeJsonRpcError(const JsonValue& id, int code, std::string_view message,
+                                      std::string_view data_json);
+  static void WriteJsonRpcId(JsonWriter& w, const JsonValue& id);
 
   static std::string GenerateSessionId();
 
@@ -212,7 +284,24 @@ private:
   std::string m_origin_header;
   std::string m_mcp_session_id_header;
   std::string m_mcp_protocol_version_header;
+  std::string m_mcp_method_header;
+  std::string m_mcp_name_header;
   std::string m_last_event_id_header;
+
+  // Per-request protocol context (set in ProcessJsonRpc, consumed when responding).
+  enum class ResultCache : u8
+  {
+    None,     // Not a cacheable result.
+    Static,   // Only changes with the binary: public, STATIC_RESULT_TTL_MS.
+    Volatile, // Emulator state: private, immediately stale.
+  };
+  bool m_request_modern = false;
+  ResultCache m_request_cache = ResultCache::None;
+
+  // subscriptions/listen stream state.
+  bool m_is_listen = false;
+  std::string m_listen_id_json;
+  std::vector<std::string> m_listen_resource_uris;
 };
 
 } // namespace
@@ -221,6 +310,8 @@ static std::unique_ptr<SocketMultiplexer> s_mcp_multiplexer;
 static std::shared_ptr<ListenSocket> s_mcp_listen_socket;
 static std::vector<std::shared_ptr<ClientSocket>> s_mcp_clients;
 static std::vector<std::shared_ptr<ClientSocket>> s_sse_clients;
+static std::vector<std::shared_ptr<ClientSocket>> s_listen_clients;
+static Timer::Value s_last_listen_keepalive = 0;
 
 // ---- VRAM write watchpoints ----
 
@@ -7085,6 +7176,13 @@ static ToolResult DispatchToolCall(const std::string& tool_name, const JsonValue
   return ToolResult::Error(JSONRPC_METHOD_NOT_FOUND, fmt::format("Unknown tool: {}", tool_name));
 }
 
+/// JSON-RPC error code for a resources/read whose backing tool failed. Not -32002: up to
+/// 2025-11-25 it meant "resource not found" (these URIs exist), and 2026-07-28 forbids it.
+static int ResourceReadErrorCode(const ToolResult& result)
+{
+  return (result.error_code == JSONRPC_INVALID_PARAMS) ? JSONRPC_INVALID_PARAMS : JSONRPC_INTERNAL_ERROR;
+}
+
 static void LogStreamCallback(void* /*pUserParam*/, Log::MessageCategory category,
                                const char* /*functionName*/, std::string_view message)
 {
@@ -7128,6 +7226,19 @@ static void NotifyResourceUpdated(const std::string& uri)
     const std::string data = fmt::format("{{\"uri\":\"{}\"}}", uri);
     BroadcastSSEEvent("notifications/resources/updated", data);
   }
+
+  // 2026-07-28: each subscriptions/listen stream carries its own resource filter.
+  for (auto& client : s_listen_clients)
+  {
+    if (!client->IsListeningToResource(uri))
+      continue;
+
+    std::string fields = "\"uri\":";
+    fields += '"';
+    JsonWriter::EscapeString(fields, uri);
+    fields += '"';
+    client->SendListenNotification("notifications/resources/updated", fields);
+  }
 }
 
 } // namespace MCPServer
@@ -7156,6 +7267,15 @@ void MCPServer::ClientSocket::OnDisconnected(const Error& error)
                    [this](const std::shared_ptr<ClientSocket>& rhs) { return (rhs.get() == this); });
     if (sse_iter != s_sse_clients.end())
       s_sse_clients.erase(sse_iter);
+  }
+
+  // Closing a subscriptions/listen stream is how the client cancels it.
+  {
+    const auto listen_iter =
+      std::find_if(s_listen_clients.begin(), s_listen_clients.end(),
+                   [this](const std::shared_ptr<ClientSocket>& rhs) { return (rhs.get() == this); });
+    if (listen_iter != s_listen_clients.end())
+      s_listen_clients.erase(listen_iter);
   }
 
   // Remove from main client list.
@@ -7276,6 +7396,9 @@ void MCPServer::ClientSocket::OnRead()
     m_origin_header.clear();
     m_mcp_session_id_header.clear();
     m_mcp_protocol_version_header.clear();
+    m_mcp_method_header.clear();
+    m_mcp_name_header.clear();
+    m_last_event_id_header.clear();
     {
       const std::string_view remaining_headers = headers_view.substr(request_line_end + 2);
       size_t pos = 0;
@@ -7301,6 +7424,10 @@ void MCPServer::ClientSocket::OnRead()
             m_mcp_session_id_header = std::string(value);
           else if (StringUtil::EqualNoCase(header_name, "mcp-protocol-version"))
             m_mcp_protocol_version_header = std::string(value);
+          else if (StringUtil::EqualNoCase(header_name, "mcp-method"))
+            m_mcp_method_header = std::string(value);
+          else if (StringUtil::EqualNoCase(header_name, "mcp-name"))
+            m_mcp_name_header = std::string(value);
           else if (StringUtil::EqualNoCase(header_name, "last-event-id"))
             m_last_event_id_header = std::string(value);
         }
@@ -7350,7 +7477,7 @@ void MCPServer::ClientSocket::OnRead()
       const std::string response = fmt::format("HTTP/1.1 204 No Content\r\n"
                                                "Access-Control-Allow-Origin: {}\r\n"
                                                "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
-                                               "Access-Control-Allow-Headers: Content-Type, Authorization, MCP-Session-Id, MCP-Protocol-Version\r\n"
+                                               "Access-Control-Allow-Headers: Content-Type, Authorization, MCP-Session-Id, MCP-Protocol-Version, Mcp-Method, Mcp-Name\r\n"
                                                "Access-Control-Expose-Headers: MCP-Session-Id\r\n"
                                                "Connection: keep-alive\r\n"
                                                "Content-Length: 0\r\n"
@@ -7396,29 +7523,12 @@ void MCPServer::ClientSocket::ProcessHttpRequest(const std::string& method, cons
 
   if (method == "POST" && base_path == "/mcp")
   {
-    // MCP-Session-Id validation: if a session exists and this is not an initialize request,
-    // the client MUST include the session ID. We check after JSON parse in ProcessJsonRpc
-    // for initialize detection, but validate the header presence here for non-initialize.
-    // (Deferred to ProcessJsonRpc where we know the method.)
+    // Protocol era, MCP-Session-Id and MCP-Protocol-Version are validated in ProcessJsonRpc,
+    // where the body tells a modern (per-request _meta) request from a legacy one.
 
-    // MCP-Protocol-Version validation: if present, must match negotiated version.
-    if (!m_mcp_protocol_version_header.empty() && !s_negotiated_protocol_version.empty())
-    {
-      if (m_mcp_protocol_version_header != s_negotiated_protocol_version)
-      {
-        WARNING_LOG("Invalid MCP-Protocol-Version '{}' (expected '{}') from {}",
-                    m_mcp_protocol_version_header, s_negotiated_protocol_version,
-                    GetRemoteAddress().ToString());
-        SendHttpResponseDirect(400, "application/json",
-          MakeJsonRpcError(JsonValue(), JSONRPC_INVALID_REQUEST,
-            fmt::format("Invalid MCP-Protocol-Version (expected '{}')", s_negotiated_protocol_version)));
-        return;
-      }
-    }
-
-    // Streamable HTTP: always respond with plain JSON for POST requests.
-    // The spec says the server MAY use SSE, but since we always have a single
-    // response per request, plain JSON is simpler and avoids SSE complexity.
+    // Streamable HTTP: respond with plain JSON for POST requests. The spec says the server
+    // MAY use SSE, but since we always have a single response per request, plain JSON is
+    // simpler. The one exception is subscriptions/listen, whose response is a stream.
     ProcessJsonRpc(body);
   }
   else if (method == "GET" && base_path == "/mcp")
@@ -7546,6 +7656,9 @@ void MCPServer::ClientSocket::ProcessHttpRequest(const std::string& method, cons
 
 void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
 {
+  m_request_modern = false;
+  m_request_cache = ResultCache::None;
+
   std::optional<JsonValue> parsed = JsonValue::Parse(json_body);
   if (!parsed.has_value())
   {
@@ -7596,19 +7709,90 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     return;
   }
 
-  // MCP-Session-Id validation: if session exists, non-initialize requests MUST include it.
-  if (!s_mcp_session_id.empty() && method != "initialize")
+  // Pick the protocol era from how the client opens (2026-07-28 "Backward Compatibility with
+  // Initialization-Based Versions"): a request carrying the per-request protocol version in
+  // _meta is served statelessly under the modern revision; anything else, initialize
+  // included, gets the legacy session semantics. A modern version in the header, or
+  // server/discover (modern only), also marks the request as modern, so that a missing
+  // _meta is reported as such instead of being mistaken for a legacy request.
+  const JsonValue& request_params = request["params"];
+  const JsonValue& request_meta = request_params["_meta"];
+  if (method != "initialize" &&
+      (request_meta.contains(META_PROTOCOL_VERSION) || method == "server/discover" ||
+       (!m_mcp_protocol_version_header.empty() && !IsLegacyProtocolVersion(m_mcp_protocol_version_header))))
   {
-    if (m_mcp_session_id_header != s_mcp_session_id)
+    m_request_modern = true;
+    if (!ValidateModernRequest(id, method, request_params))
+      return;
+  }
+  else if (method != "initialize")
+  {
+    // Legacy: once a session exists, requests MUST carry its ID...
+    if (!s_mcp_session_id.empty() && m_mcp_session_id_header != s_mcp_session_id)
     {
       WARNING_LOG("Request missing or invalid MCP-Session-Id from {}", GetRemoteAddress().ToString());
       const std::string error = MakeJsonRpcError(id, JSONRPC_INVALID_REQUEST, "Bad Request: missing or invalid MCP-Session-Id");
       SendHttpResponse(400, "application/json", error);
       return;
     }
+
+    // ...and, if they send MCP-Protocol-Version, the negotiated one.
+    if (!m_mcp_protocol_version_header.empty() && !s_negotiated_protocol_version.empty() &&
+        m_mcp_protocol_version_header != s_negotiated_protocol_version)
+    {
+      WARNING_LOG("Invalid MCP-Protocol-Version '{}' (expected '{}') from {}", m_mcp_protocol_version_header,
+                  s_negotiated_protocol_version, GetRemoteAddress().ToString());
+      SendHttpResponse(400, "application/json",
+                       MakeJsonRpcError(id, JSONRPC_INVALID_REQUEST,
+                                        fmt::format("Invalid MCP-Protocol-Version '{}' (expected '{}')",
+                                                    m_mcp_protocol_version_header, s_negotiated_protocol_version)));
+      return;
+    }
   }
 
-  if (method == "initialize")
+  // Methods that 2026-07-28 removed: ping, logging/setLevel (log level is now per request)
+  // and resources/(un)subscribe (replaced by subscriptions/listen). They stay for legacy
+  // sessions only. Unknown methods on a modern request get 404, so that a dual-era client
+  // can tell "not implemented" from a legacy HTTP+SSE server by the JSON-RPC body.
+  if (m_request_modern &&
+      (method == "ping" || method == "logging/setLevel" || method == "resources/subscribe" ||
+       method == "resources/unsubscribe"))
+  {
+    SendHttpResponse(404, "application/json",
+                     MakeJsonRpcError(id, JSONRPC_METHOD_NOT_FOUND,
+                                      fmt::format("Method not found: {} is not part of protocol version {}", method,
+                                                  MODERN_PROTOCOL_VERSIONS[0])));
+    return;
+  }
+
+  if (method == "tools/list" || method == "prompts/list" || method == "resources/list")
+    m_request_cache = ResultCache::Static;
+  else if (method == "resources/read")
+    m_request_cache = ResultCache::Volatile;
+
+  if (method == "server/discover")
+  {
+    m_request_cache = ResultCache::Static;
+
+    JsonWriter w;
+    w.StartObject();
+    w.Key("supportedVersions");
+    WriteSupportedProtocolVersions(w);
+    w.Key("capabilities");
+    w.StartObject();
+    w.Key("tools"); w.StartObject(); w.KeyBool("listChanged", false); w.EndObject();
+    w.Key("resources"); w.StartObject(); w.KeyBool("subscribe", true); w.KeyBool("listChanged", false); w.EndObject();
+    w.Key("prompts"); w.StartObject(); w.KeyBool("listChanged", false); w.EndObject();
+    w.Key("completions"); w.StartObject(); w.EndObject();
+    w.EndObject();
+    w.EndObject();
+    SendHttpResponse(200, "application/json", MakeJsonRpcResponse(id, w.GetOutput()));
+  }
+  else if (method == "subscriptions/listen")
+  {
+    StartListenStream(id, request_params);
+  }
+  else if (method == "initialize")
   {
     // Read client's requested protocol version.
     const JsonValue& params = request["params"];
@@ -7617,26 +7801,15 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
       ? std::string(params["protocolVersion"].get_string())
       : std::string();
 
-    // Supported protocol versions (newest first).
-    static constexpr const char* SUPPORTED_VERSIONS[] = {"2025-11-25", "2025-03-26"};
-    std::string negotiated_version = SUPPORTED_VERSIONS[0];
-
-    if (!client_version.empty())
-    {
-      bool found = false;
-      for (const char* v : SUPPORTED_VERSIONS)
-      {
-        if (client_version == v)
-        {
-          negotiated_version = v;
-          found = true;
-          break;
-        }
-      }
-      if (!found)
-        WARNING_LOG("Client requested unsupported protocol version '{}', using '{}'",
-                    client_version, SUPPORTED_VERSIONS[0]);
-    }
+    // Only legacy versions can be negotiated here: modern ones have no handshake. A client
+    // asking for anything else (a modern version included) is offered our newest legacy one
+    // and decides whether it can speak it.
+    std::string negotiated_version = LEGACY_PROTOCOL_VERSIONS[0];
+    if (IsLegacyProtocolVersion(client_version))
+      negotiated_version = client_version;
+    else if (!client_version.empty())
+      WARNING_LOG("Client requested protocol version '{}' in initialize, offering '{}'", client_version,
+                  negotiated_version);
 
     // Reset state from any prior session so a new client starts clean (no inherited
     // memory scan, snapshot, input sequence, subscriptions, or log streaming).
@@ -7655,12 +7828,13 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     w.Key("tools"); w.StartObject(); w.KeyBool("listChanged", false); w.EndObject();
     w.Key("resources"); w.StartObject(); w.KeyBool("subscribe", true); w.KeyBool("listChanged", false); w.EndObject();
     w.Key("prompts"); w.StartObject(); w.KeyBool("listChanged", false); w.EndObject();
+    w.Key("completions"); w.StartObject(); w.EndObject();
     w.Key("logging"); w.StartObject(); w.EndObject();
     w.EndObject();
     w.Key("serverInfo");
     w.StartObject();
-    w.KeyString("name", "duckstation-mcp");
-    w.KeyString("version", "1.0.0");
+    w.KeyString("name", SERVER_NAME);
+    w.KeyString("version", SERVER_VERSION);
     w.EndObject();
     w.EndObject();
     const std::string response = MakeJsonRpcResponse(id, w.GetOutput());
@@ -7807,6 +7981,14 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
 
     const ToolResult tool_result = DispatchToolCall(tool_name, tool_args);
 
+    // An unknown tool is a protocol error (-32602), not a tool execution error: the model
+    // cannot fix it by retrying with other arguments.
+    if (tool_result.error_code == JSONRPC_METHOD_NOT_FOUND)
+    {
+      SendHttpResponse(200, "application/json", MakeJsonRpcError(id, JSONRPC_INVALID_PARAMS, tool_result.text));
+      return;
+    }
+
     // Notify the frontend (if registered) so it can refresh debugger views.
     if (!tool_result.IsError() && s_state_changed_callback)
       Host::RunOnUIThread(s_state_changed_callback);
@@ -7891,7 +8073,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
           const ToolResult mem_result = HandleReadMemory(mem_args.value());
           if (mem_result.IsError())
           {
-            const std::string response = MakeJsonRpcError(id, MCP_ERR_OPERATION_FAILED, mem_result.text);
+            const std::string response = MakeJsonRpcError(id, ResourceReadErrorCode(mem_result), mem_result.text);
             SendHttpResponse(200, "application/json", response);
             return;
           }
@@ -7918,7 +8100,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
       const ToolResult map_result = HandleGetMemoryMap(JsonValue());
       if (map_result.IsError())
       {
-        const std::string response = MakeJsonRpcError(id, MCP_ERR_OPERATION_FAILED, map_result.text);
+        const std::string response = MakeJsonRpcError(id, ResourceReadErrorCode(map_result), map_result.text);
         SendHttpResponse(200, "application/json", response);
         return;
       }
@@ -8352,8 +8534,9 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     }
     else
     {
+      // 2026-07-28 requires 404 for an unimplemented method; legacy clients got 200.
       const std::string response = MakeJsonRpcError(id, JSONRPC_METHOD_NOT_FOUND, "Method not found");
-      SendHttpResponse(200, "application/json", response);
+      SendHttpResponse(m_request_modern ? 404 : 200, "application/json", response);
     }
   }
 }
@@ -8361,9 +8544,16 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
 void MCPServer::ClientSocket::SendHttpResponse(int status_code, std::string_view content_type,
                                                std::string_view body)
 {
-  // MCP spec: include MCP-Session-Id and MCP-Protocol-Version on all responses
-  // when a session is active. This ensures clients can track the session.
+  // Legacy MCP: include MCP-Session-Id and MCP-Protocol-Version on all responses when a
+  // session is active, so clients can track it. 2026-07-28 has no sessions: servers must
+  // not echo session IDs on modern requests.
   std::string extra_headers;
+  if (m_request_modern)
+  {
+    SendHttpResponseDirect(status_code, content_type, body);
+    return;
+  }
+
   if (!s_mcp_session_id.empty())
   {
     extra_headers += fmt::format("MCP-Session-Id: {}\r\n"
@@ -8489,12 +8679,8 @@ int MCPServer::ClientSocket::ReplaySSEEventsFrom(u64 last_event_id)
   return replayed;
 }
 
-std::string MCPServer::ClientSocket::MakeJsonRpcResponse(const JsonValue& id, std::string_view result_json)
+void MCPServer::ClientSocket::WriteJsonRpcId(JsonWriter& w, const JsonValue& id)
 {
-  JsonWriter w;
-  w.StartObject();
-  w.KeyString("jsonrpc", "2.0");
-  w.Key("id");
   if (id.is_null())
     w.Null();
   else if (id.is_string())
@@ -8503,33 +8689,292 @@ std::string MCPServer::ClientSocket::MakeJsonRpcResponse(const JsonValue& id, st
     w.Uint(id.get_uint());
   else
     w.Int(id.get_int());
+}
+
+std::string MCPServer::ClientSocket::MakeJsonRpcResponse(const JsonValue& id, std::string_view result_json) const
+{
+  JsonWriter w;
+  w.StartObject();
+  w.KeyString("jsonrpc", "2.0");
+  w.Key("id");
+  WriteJsonRpcId(w, id);
   w.Key("result");
-  w.RawValue(result_json);
+  if (!m_request_modern)
+  {
+    w.RawValue(result_json);
+  }
+  else
+  {
+    // 2026-07-28: every result carries resultType, servers SHOULD identify themselves in
+    // each result's _meta, and cacheable results MUST carry ttlMs and cacheScope. None of
+    // our result bodies has these keys, so splice them in front of the existing members.
+    JsonWriter mw;
+    mw.StartObject();
+    mw.KeyString("resultType", "complete");
+    mw.Key("_meta");
+    mw.StartObject();
+    mw.Key(META_SERVER_INFO);
+    mw.StartObject();
+    mw.KeyString("name", SERVER_NAME);
+    mw.KeyString("version", SERVER_VERSION);
+    mw.EndObject();
+    mw.EndObject();
+    if (m_request_cache == ResultCache::Static)
+    {
+      mw.KeyUint("ttlMs", STATIC_RESULT_TTL_MS);
+      mw.KeyString("cacheScope", "public");
+    }
+    else if (m_request_cache == ResultCache::Volatile)
+    {
+      mw.KeyUint("ttlMs", 0);
+      mw.KeyString("cacheScope", "private");
+    }
+    mw.EndObject();
+
+    std::string merged = mw.TakeOutput();
+    const size_t body_start = result_json.find('{');
+    const std::string_view members =
+      (body_start != std::string_view::npos) ? result_json.substr(body_start + 1) : std::string_view("}");
+    const size_t first_member = members.find_first_not_of(" \t\r\n");
+    merged.pop_back(); // closing brace of the injected fields
+    if (first_member != std::string_view::npos && members[first_member] != '}')
+      merged += ',';
+    merged += members;
+    w.RawValue(merged);
+  }
   w.EndObject();
   return w.TakeOutput();
 }
 
 std::string MCPServer::ClientSocket::MakeJsonRpcError(const JsonValue& id, int code, std::string_view message)
 {
+  return MakeJsonRpcError(id, code, message, {});
+}
+
+std::string MCPServer::ClientSocket::MakeJsonRpcError(const JsonValue& id, int code, std::string_view message,
+                                                      std::string_view data_json)
+{
   JsonWriter w;
   w.StartObject();
   w.KeyString("jsonrpc", "2.0");
   w.Key("id");
-  if (id.is_null())
-    w.Null();
-  else if (id.is_string())
-    w.String(id.get_string());
-  else if (id.is_number_unsigned())
-    w.Uint(id.get_uint());
-  else
-    w.Int(id.get_int());
+  WriteJsonRpcId(w, id);
   w.Key("error");
   w.StartObject();
   w.KeyInt("code", code);
   w.KeyString("message", message);
+  if (!data_json.empty())
+    w.KeyRawValue("data", data_json);
   w.EndObject();
   w.EndObject();
   return w.TakeOutput();
+}
+
+bool MCPServer::ClientSocket::ValidateModernRequest(const JsonValue& id, std::string_view method,
+                                                    const JsonValue& params)
+{
+  const auto reject = [this, &id](int code, std::string_view message, std::string_view data_json = {}) {
+    WARNING_LOG("Rejected 2026-07-28 request from {}: {}", GetRemoteAddress().ToString(), message);
+    SendHttpResponse(400, "application/json", MakeJsonRpcError(id, code, message, data_json));
+    return false;
+  };
+
+  // Per-request protocol fields: protocolVersion and clientCapabilities are required.
+  const JsonValue& meta = params["_meta"];
+  const JsonValue& version_val = meta[META_PROTOCOL_VERSION];
+  if (!version_val.is_string())
+  {
+    return reject(JSONRPC_INVALID_PARAMS,
+                  fmt::format("Invalid params: _meta must carry '{}' (string)", META_PROTOCOL_VERSION));
+  }
+  const std::string_view version = version_val.get_string();
+
+  // The MCP-Protocol-Version header MUST be present and match the body.
+  if (m_mcp_protocol_version_header.empty())
+    return reject(MCP_ERR_HEADER_MISMATCH, "Header mismatch: missing MCP-Protocol-Version header");
+  if (m_mcp_protocol_version_header != version)
+  {
+    return reject(MCP_ERR_HEADER_MISMATCH,
+                  fmt::format("Header mismatch: MCP-Protocol-Version header value '{}' does not match body value '{}'",
+                              m_mcp_protocol_version_header, version));
+  }
+
+  if (!IsModernProtocolVersion(version))
+  {
+    JsonWriter dw;
+    dw.StartObject();
+    dw.Key("supported");
+    WriteSupportedProtocolVersions(dw);
+    dw.KeyString("requested", version);
+    dw.EndObject();
+    return reject(MCP_ERR_UNSUPPORTED_PROTOCOL_VERSION,
+                  IsLegacyProtocolVersion(version) ?
+                    fmt::format("Unsupported protocol version: {} is only available through initialize", version) :
+                    std::string("Unsupported protocol version"),
+                  dw.GetOutput());
+  }
+
+  if (!meta[META_CLIENT_CAPABILITIES].is_object())
+  {
+    return reject(JSONRPC_INVALID_PARAMS,
+                  fmt::format("Invalid params: _meta must carry '{}' (object)", META_CLIENT_CAPABILITIES));
+  }
+
+  // Standard request headers mirror the body so intermediaries can route on them; the server
+  // MUST reject a request where they are missing or disagree with it.
+  if (m_mcp_method_header.empty())
+    return reject(MCP_ERR_HEADER_MISMATCH, "Header mismatch: missing Mcp-Method header");
+  if (m_mcp_method_header != method)
+  {
+    return reject(MCP_ERR_HEADER_MISMATCH,
+                  fmt::format("Header mismatch: Mcp-Method header value '{}' does not match body value '{}'",
+                              m_mcp_method_header, method));
+  }
+
+  const char* name_field = (method == "tools/call" || method == "prompts/get") ? "name" :
+                           (method == "resources/read")                        ? "uri" :
+                                                                                 nullptr;
+  if (name_field)
+  {
+    if (m_mcp_name_header.empty())
+      return reject(MCP_ERR_HEADER_MISMATCH, "Header mismatch: missing Mcp-Name header");
+
+    // Values that are not plain header-safe ASCII arrive as =?base64?...?=.
+    std::string header_name = m_mcp_name_header;
+    if (header_name.size() >= 11 && header_name.starts_with("=?base64?") && header_name.ends_with("?="))
+    {
+      const std::optional<std::vector<u8>> decoded =
+        StringUtil::DecodeBase64(std::string_view(header_name).substr(9, header_name.size() - 11));
+      if (!decoded.has_value())
+        return reject(MCP_ERR_HEADER_MISMATCH, "Header mismatch: Mcp-Name header has invalid Base64 encoding");
+      header_name.assign(reinterpret_cast<const char*>(decoded->data()), decoded->size());
+    }
+
+    const JsonValue& body_name = params[name_field];
+    if (!body_name.is_string() || body_name.get_string() != header_name)
+    {
+      return reject(MCP_ERR_HEADER_MISMATCH,
+                    fmt::format("Header mismatch: Mcp-Name header value '{}' does not match body value '{}'",
+                                header_name, body_name.is_string() ? body_name.get_string() : std::string_view()));
+    }
+  }
+
+  return true;
+}
+
+void MCPServer::ClientSocket::StartListenStream(const JsonValue& id, const JsonValue& params)
+{
+  const JsonValue& filter = params["notifications"];
+  if (!filter.is_object())
+  {
+    SendHttpResponse(200, "application/json",
+                     MakeJsonRpcError(id, JSONRPC_INVALID_PARAMS, "Invalid params: missing 'notifications' filter"));
+    return;
+  }
+
+  if (s_listen_clients.size() >= MAX_SSE_CLIENTS)
+  {
+    SendHttpResponse(503, "application/json",
+                     MakeJsonRpcError(id, JSONRPC_INTERNAL_ERROR, "Too many subscriptions/listen streams"));
+    return;
+  }
+
+  // Only resource updates can ever fire: our tool, prompt and resource lists are fixed, so the
+  // *ListChanged types are left out of the acknowledgment, which lists what we will honour.
+  m_listen_resource_uris.clear();
+  const JsonValue& uris = filter["resourceSubscriptions"];
+  if (uris.is_array())
+  {
+    for (const JsonValue& uri : uris)
+    {
+      if (uri.is_string())
+        m_listen_resource_uris.emplace_back(uri.get_string());
+    }
+  }
+
+  JsonWriter iw;
+  WriteJsonRpcId(iw, id);
+  m_listen_id_json = iw.TakeOutput();
+  m_is_listen = true;
+  s_listen_clients.push_back(std::static_pointer_cast<ClientSocket>(shared_from_this()));
+
+  INFO_LOG("Client {} opened subscriptions/listen stream {} ({} resource(s)).", GetRemoteAddress().ToString(),
+           m_listen_id_json, m_listen_resource_uris.size());
+
+  const std::string sse_headers = fmt::format("HTTP/1.1 200 OK\r\n"
+                                              "Content-Type: text/event-stream\r\n"
+                                              "Cache-Control: no-cache\r\n"
+                                              "X-Accel-Buffering: no\r\n"
+                                              "Connection: keep-alive\r\n"
+                                              "Access-Control-Allow-Origin: {}\r\n"
+                                              "\r\n",
+                                              s_cors_origin);
+  Write(sse_headers.data(), sse_headers.size());
+
+  // The acknowledgment MUST be the first message on the stream.
+  JsonWriter aw;
+  aw.StartObject();
+  aw.Key("notifications");
+  aw.StartObject();
+  if (!m_listen_resource_uris.empty())
+  {
+    aw.Key("resourceSubscriptions");
+    aw.StartArray();
+    for (const std::string& uri : m_listen_resource_uris)
+      aw.String(uri);
+    aw.EndArray();
+  }
+  aw.EndObject();
+  aw.EndObject();
+  const std::string_view ack = aw.GetOutput();
+  SendListenNotification("notifications/subscriptions/acknowledged", ack.substr(1, ack.size() - 2));
+}
+
+bool MCPServer::ClientSocket::IsListeningToResource(std::string_view uri) const
+{
+  return m_is_listen && std::find(m_listen_resource_uris.begin(), m_listen_resource_uris.end(), uri) !=
+                          m_listen_resource_uris.end();
+}
+
+void MCPServer::ClientSocket::SendListenNotification(std::string_view method, std::string_view params_fields)
+{
+  if (!m_is_listen)
+    return;
+
+  // Every message on the stream carries the ID of the listen request that opened it.
+  std::string event =
+    fmt::format("data: {{\"jsonrpc\":\"2.0\",\"method\":\"{}\",\"params\":{{\"_meta\":{{\"{}\":{}}}", method,
+                META_SUBSCRIPTION_ID, m_listen_id_json);
+  if (!params_fields.empty())
+  {
+    event += ',';
+    event += params_fields;
+  }
+  event += "}}\n\n";
+  if (size_t written = Write(event.data(), event.size()); written != event.size())
+    ERROR_LOG("Only wrote {} of {} listen stream bytes.", written, event.size());
+}
+
+void MCPServer::ClientSocket::SendListenKeepAlive()
+{
+  if (!m_is_listen)
+    return;
+
+  static constexpr std::string_view keepalive = ": keep-alive\n\n";
+  Write(keepalive.data(), keepalive.size());
+}
+
+void MCPServer::ClientSocket::CloseListenStream()
+{
+  if (!m_is_listen)
+    return;
+
+  const std::string event = fmt::format("data: {{\"jsonrpc\":\"2.0\",\"id\":{0},\"result\":{{\"resultType\":\"complete\","
+                                        "\"_meta\":{{\"{1}\":{0}}}}}}}\n\n",
+                                        m_listen_id_json, META_SUBSCRIPTION_ID);
+  Write(event.data(), event.size());
+  m_is_listen = false;
+  Close();
 }
 
 void MCPServer::ClientSocket::OnSystemPaused()
@@ -8595,6 +9040,12 @@ void MCPServer::Shutdown()
 
   BroadcastSSEEvent("system_shutdown", "{}");
 
+  // End subscriptions/listen streams gracefully: answering the listen request tells the
+  // client the subscription closed on purpose rather than dropped.
+  for (const std::shared_ptr<ClientSocket>& client : std::vector<std::shared_ptr<ClientSocket>>(s_listen_clients))
+    client->CloseListenStream();
+  s_listen_clients.clear();
+
   INFO_LOG("Disconnecting {} MCP clients...", s_mcp_clients.size());
   while (!s_mcp_clients.empty())
   {
@@ -8647,6 +9098,18 @@ void MCPServer::PollUntil(u64 max_poll_time)
 {
   if (!s_mcp_multiplexer)
     return;
+
+  // Keep idle subscriptions/listen streams from being dropped by client or proxy timeouts.
+  if (!s_listen_clients.empty())
+  {
+    const Timer::Value now = Timer::GetCurrentValue();
+    if (Timer::ConvertValueToSeconds(now - s_last_listen_keepalive) >= LISTEN_KEEPALIVE_INTERVAL_SECONDS)
+    {
+      s_last_listen_keepalive = now;
+      for (const std::shared_ptr<ClientSocket>& client : s_listen_clients)
+        client->SendListenKeepAlive();
+    }
+  }
 
   if (max_poll_time == 0)
   {
