@@ -5965,8 +5965,8 @@ static ToolResult HandleTriggerHotkey(const JsonValue& args)
         return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,fmt::format("Hotkey '{}' has no handler", name));
 
       // Simulate press then release
-      hk.handler(1);
-      hk.handler(0);
+      hk.handler(InputButtonEvent::Pressed);
+      hk.handler(InputButtonEvent::Released);
 
       JsonWriter w;
       w.StartObject();
