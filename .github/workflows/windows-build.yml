@@ -26,32 +26,14 @@ jobs:
             updatername: "updater-x64-ReleaseLTCG.exe"
             installername: "installer-x64-ReleaseLTCG.exe"
             uninstallername: "uninstaller-x64-ReleaseLTCG.exe"
-          - name: "x64 SSE2"
-            arch: "x64-sse2"
-            vcvars: "x64"
-            config: "ReleaseLTCG-Clang-SSE2"
-            platform: "x64"
-            bindir: "x64"
-            assetname: "duckstation-windows-x64-sse2-release.zip"
-            installerassetname: "duckstation-windows-x64-sse2-installer.exe"
-            updatername: "updater-x64-ReleaseLTCG-SSE2.exe"
-            installername: "installer-x64-ReleaseLTCG-SSE2.exe"
-            uninstallername: "uninstaller-x64-ReleaseLTCG-SSE2.exe"
-          - name: "ARM64"
-            arch: "arm64"
-            vcvars: "amd64_arm64"
-            config: "ReleaseLTCG-Clang"
-            platform: "ARM64"
-            bindir: "ARM64"
-            assetname: "duckstation-windows-arm64-release.zip"
-            installerassetname: "duckstation-windows-arm64-installer.exe"
-            updatername: "updater-ARM64-ReleaseLTCG.exe"
-            installername: "installer-ARM64-ReleaseLTCG.exe"
-            uninstallername: "uninstaller-ARM64-ReleaseLTCG.exe"
     steps:
     - uses: actions/checkout@v7
       with:
         fetch-depth: 0
+
+    - name: Apply MCP window identity extension
+      shell: bash
+      run: git apply extras/mcp-window-identity/window-identity.patch
 
     - name: Download x64 Dependencies
       shell: bash

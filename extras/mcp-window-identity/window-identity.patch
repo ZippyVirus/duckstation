@@ -1,0 +1,333 @@
+--- a/src/core/mcp_server.cpp
++++ b/src/core/mcp_server.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: CC-BY-NC-ND-4.0
+ 
+ #include "mcp_server.h"
++#include <cstdlib>
+ #include "bus.h"
+ #include "cdrom.h"
+ #include "cpu_core.h"
+@@ -104,6 +105,7 @@
+ 
+ /// Frontend callback for post-tool-call UI refresh.
+ static StateChangedCallback s_state_changed_callback;
++static WindowIdentity s_window_identity;
+ 
+ /// JSON-RPC 2.0 standard error codes (��5.1). Mirrored as named constants here so call
+ /// sites read uniformly with the MCP-specific codes below rather than mixing literals.
+@@ -400,6 +402,7 @@
+ /// active input sequence, resource subscriptions, and log streaming state.
+ static void ResetSessionState()
+ {
++  s_window_identity.SetClient({});
+   s_active_sequence.reset();
+   s_subscribed_resources.clear();
+   s_memory_scan.ResetSearch();
+@@ -6959,8 +6962,42 @@
+   return ToolResult{w.TakeOutput()};
+ }
+ 
++static ToolResult HandleMCPIdentity(const JsonValue& args)
++{
++  const std::string action = args.contains("action") && args["action"].is_string()
++    ? std::string(args["action"].get_string()) : "get";
++  if (action == "set")
++  {
++    if (!args.contains("owner") || !args["owner"].is_string() ||
++        WindowIdentity::Clean(args["owner"].get_string()).empty())
++      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "A nonempty printable owner label is required");
++    if (args.contains("task") && !args["task"].is_string())
++      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "task must be a string");
++    s_window_identity.SetOwner(args["owner"].get_string(),
++      args.contains("task") ? args["task"].get_string() : std::string_view());
++  }
++  else if (action == "clear")
++    s_window_identity.SetOwner({}, {});
++  else if (action != "get")
++    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "action must be get, set, or clear");
++
++  const auto identity = s_window_identity.Get();
++  JsonWriter w;
++  w.StartObject();
++  w.KeyUint("port", identity.port);
++  w.KeyString("owner", identity.owner);
++  w.KeyString("task", identity.task);
++  w.KeyString("client", identity.client);
++  w.KeyString("title_suffix", identity.Suffix());
++  w.KeyString("ownership_semantics", "Declared instance assignment, not an access-control lock");
++  w.EndObject();
++  return ToolResult{w.TakeOutput()};
++}
++
+ static ToolResult DispatchToolCall(const std::string& tool_name, const JsonValue& args)
+ {
++  if (tool_name == "mcp_identity")
++    return HandleMCPIdentity(args);
+   if (tool_name == "read_registers")
+     return HandleReadRegisters(args);
+   else if (tool_name == "write_register")
+@@ -7816,6 +7853,9 @@
+     ResetSessionState();
+ 
+     // Generate a new crypto-secure session ID.
++    if (params.contains("clientInfo") && params["clientInfo"].is_object() &&
++        params["clientInfo"].contains("name") && params["clientInfo"]["name"].is_string())
++      s_window_identity.SetClient(params["clientInfo"]["name"].get_string());
+     s_mcp_session_id = GenerateSessionId();
+     s_negotiated_protocol_version = negotiated_version;
+     INFO_LOG("MCP session initialized: id={}, protocol={}", s_mcp_session_id, negotiated_version);
+@@ -7851,6 +7891,7 @@
+     // clang-format off
+     // Static tool definitions as raw JSON.
+     static constexpr const char TOOLS_JSON[] = R"json({"tools":[
++{"name":"mcp_identity","description":"Get or declare this emulator instance owner (LLM) and task. Call action=set only on your assigned endpoint. Labels are advisory, not locks. Owner persists across HTTP sessions until cleared or the server restarts. Client name is separately reported from initialize.clientInfo. For stateless MCP use this tool to declare the owner.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["get","set","clear"],"default":"get"},"owner":{"type":"string","description":"Explicit LLM/client assignment, e.g. Codex or Claude"},"task":{"type":"string","description":"Task label, e.g. widescreen or Heat port"}}},"title":"MCP Instance Identity","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
+ {"name":"read_registers","description":"Read CPU registers (GPR, COP0, GTE). Returns: JSON object with register names as keys and hex string values (e.g. {\"v0\":\"0x00000001\", \"sp\":\"0x801FFF00\", ...}).","inputSchema":{"type":"object","properties":{"group":{"type":"string","enum":["gpr","cop0","gte","all"],"default":"all","description":"Register group to read"}}},"title":"Read Registers","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
+ {"name":"write_register","description":"Write a value to a CPU register by name. Returns: {register, value} confirming the written value.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Register name (e.g. 'v0', 'sp', 'pc', 'COP0_SR')"},"value":{"description":"Value to write (integer or hex string like '0x80010000')"}},"required":["name","value"]},"title":"Write Register","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
+ {"name":"disassemble","description":"Disassemble MIPS instructions at a given address. Returns: JSON array of {address, bytes, instruction, comment} objects, one per instruction.","inputSchema":{"type":"object","properties":{"address":{"description":"Start address (integer or hex string)"},"count":{"type":"integer","default":20,"description":"Number of instructions to disassemble"}},"required":["address"]},"title":"Disassemble","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
+@@ -8996,6 +9037,11 @@
+ 
+ bool MCPServer::Initialize(u16 port, std::string_view auth_token, std::string_view cors_origin)
+ {
++  if (port == 0)
++  {
++    ERROR_LOG("MCP requires an explicit nonzero port");
++    return false;
++  }
+   s_auth_token = std::string(auth_token);
+   s_cors_origin = cors_origin.empty() ? std::string("*") : std::string(cors_origin);
+ 
+@@ -9024,10 +9070,18 @@
+     return false;
+   }
+ 
++  const char* owner = std::getenv("DUCKSTATION_MCP_OWNER");
++  const char* task = std::getenv("DUCKSTATION_MCP_TASK");
++  s_window_identity.Start(port, owner ? owner : "", task ? task : "");
+   INFO_LOG("MCP server is now listening on {}.", address->ToString());
+   return true;
+ }
+ 
++WindowIdentity::Snapshot MCPServer::GetWindowIdentity()
++{
++  return s_window_identity.Get();
++}
++
+ bool MCPServer::IsActive()
+ {
+   return s_mcp_listen_socket != nullptr;
+@@ -9035,6 +9089,7 @@
+ 
+ void MCPServer::Shutdown()
+ {
++  s_window_identity.Stop();
+   if (!s_mcp_listen_socket)
+     return;
+ 
+--- a/src/core/mcp_server.h
++++ b/src/core/mcp_server.h
+@@ -4,6 +4,7 @@
+ #pragma once
+ 
+ #include "common/types.h"
++#include "mcp_window_identity.h"
+ 
+ #include <functional>
+ #include <string_view>
+@@ -27,6 +28,9 @@
+ /// Returns true if the MCP server listen socket is active.
+ bool IsActive();
+ 
++// Thread-safe UI snapshot, never reads socket state.
++WindowIdentity::Snapshot GetWindowIdentity();
++
+ /// Polls the server's socket multiplexer. Called from the core thread's idle loop:
+ /// upstream no longer keeps a shared multiplexer for the system to poll, so a server
+ /// that owns one must have it pumped, or it accepts no connections at all.
+--- a/src/duckstation-qt/mainwindow.cpp
++++ b/src/duckstation-qt/mainwindow.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: CC-BY-NC-ND-4.0
+ 
+ #include "mainwindow.h"
++#include "mcp_window_titles.h"
+ #include "aboutdialog.h"
+ #include "achievementlogindialog.h"
+ #include "autoupdaterdialog.h"
+@@ -192,6 +193,9 @@
+ {
+   Assert(!g_main_window);
+   g_main_window = this;
++#ifdef ENABLE_MCP_SERVER
++  MCPWindowTitles::Install();
++#endif
+   initialize();
+ }
+ 
+--- /dev/null
++++ b/src/core/mcp_window_identity.h
+@@ -0,0 +1,87 @@
++// Local native DuckStation MCP extension. New code, not original emulator logic.
++#pragma once
++
++#include <cstdint>
++#include <mutex>
++#include <string>
++#include <string_view>
++
++namespace MCPServer {
++// Core thread writes, Qt UI thread reads. Never expose the socket or session state.
++class WindowIdentity
++{
++public:
++  struct Snapshot
++  {
++    std::uint16_t port = 0;
++    std::string owner;
++    std::string task;
++    std::string client;
++
++    std::string Suffix() const
++    {
++      if (!port)
++        return {};
++      std::string result = " [MCP :" + std::to_string(port) + " | Owner: " +
++                           (owner.empty() ? "unassigned" : owner);
++      if (!task.empty())
++        result += " / " + task;
++      if (!client.empty())
++        result += " | Client: " + client;
++      return result + "]";
++    }
++  };
++
++  // Labels are short, printable ASCII, without title delimiters or control codes.
++  static std::string Clean(std::string_view value)
++  {
++    std::string result;
++    for (const unsigned char ch : value)
++    {
++      if (result.size() == 96)
++        break;
++      const char c = (ch >= 32 && ch < 127 && ch != '|' && ch != '[' && ch != ']') ? ch : ' ';
++      if (c != ' ' || (!result.empty() && result.back() != ' '))
++        result += c;
++    }
++    while (!result.empty() && result.back() == ' ')
++      result.pop_back();
++    return result;
++  }
++
++  void Start(std::uint16_t port, std::string_view owner, std::string_view task)
++  {
++    std::lock_guard lock(m_mutex);
++    m_state = {port, Clean(owner), Clean(task), {}};
++  }
++
++  void Stop()
++  {
++    std::lock_guard lock(m_mutex);
++    m_state = {};
++  }
++
++  void SetOwner(std::string_view owner, std::string_view task)
++  {
++    std::lock_guard lock(m_mutex);
++    m_state.owner = Clean(owner);
++    m_state.task = Clean(task);
++  }
++
++  void SetClient(std::string_view client)
++  {
++    std::lock_guard lock(m_mutex);
++    m_state.client = Clean(client);
++  }
++
++  Snapshot Get() const
++  {
++    std::lock_guard lock(m_mutex);
++    return m_state;
++  }
++
++private:
++  mutable std::mutex m_mutex;
++  Snapshot m_state;
++};
++} // namespace MCPServer
+--- /dev/null
++++ b/src/duckstation-qt/mcp_window_titles.h
+@@ -0,0 +1,73 @@
++// Local native DuckStation MCP extension. Runs only on the Qt UI thread.
++#pragma once
++
++#include "core/mcp_server.h"
++
++#ifdef ENABLE_MCP_SERVER
++#include <QtCore/QEvent>
++#include <QtCore/QObject>
++#include <QtCore/QTimer>
++#include <QtCore/QVariant>
++#include <QtWidgets/QApplication>
++#include <QtWidgets/QWidget>
++
++namespace MCPWindowTitles {
++class Filter final : public QObject
++{
++public:
++  explicit Filter(QObject* parent) : QObject(parent)
++  {
++    qApp->installEventFilter(this);
++    auto* timer = new QTimer(this);
++    connect(timer, &QTimer::timeout, this, [this]() { Refresh(); });
++    timer->start(500);
++    Refresh();
++  }
++
++protected:
++  bool eventFilter(QObject* object, QEvent* event) override
++  {
++    if (!m_updating && (event->type() == QEvent::Show || event->type() == QEvent::WindowTitleChange))
++    {
++      if (auto* widget = qobject_cast<QWidget*>(object); widget && widget->isWindow())
++        Decorate(widget);
++    }
++    return false;
++  }
++
++private:
++  void Decorate(QWidget* widget)
++  {
++    const QString current = widget->windowTitle();
++    const QString last = widget->property("_mcpDecoratedTitle").toString();
++    const QString base = (current == last) ? widget->property("_mcpBaseTitle").toString() : current;
++    const std::string suffix = MCPServer::GetWindowIdentity().Suffix();
++    const QString decorated = base + QString::fromUtf8(suffix.data(), static_cast<qsizetype>(suffix.size()));
++    widget->setProperty("_mcpBaseTitle", base);
++    widget->setProperty("_mcpDecoratedTitle", decorated);
++    if (current != decorated)
++    {
++      m_updating = true;
++      widget->setWindowTitle(decorated);
++      m_updating = false;
++    }
++  }
++
++  void Refresh()
++  {
++    for (QWidget* widget : QApplication::topLevelWidgets())
++      Decorate(widget);
++  }
++
++  bool m_updating = false;
++};
++
++inline void Install()
++{
++  // Application lifetime: survives MainWindow recreation and covers newly opened dialogs,
++  // detached render windows, debugger windows, and every instance using this executable.
++  static auto* filter = new Filter(qApp);
++  (void)filter;
++}
++} // namespace MCPWindowTitles
++#endif
+
