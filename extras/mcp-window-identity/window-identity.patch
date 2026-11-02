@@ -14,7 +14,7 @@
  static StateChangedCallback s_state_changed_callback;
 +static WindowIdentity s_window_identity;
  
- /// JSON-RPC 2.0 standard error codes (��5.1). Mirrored as named constants here so call
+ /// JSON-RPC 2.0 standard error codes (§5.1). Mirrored as named constants here so call
  /// sites read uniformly with the MCP-specific codes below rather than mixing literals.
 @@ -400,6 +402,7 @@
  /// active input sequence, resource subscriptions, and log streaming state.
@@ -330,4 +330,3 @@
 +}
 +} // namespace MCPWindowTitles
 +#endif
-
