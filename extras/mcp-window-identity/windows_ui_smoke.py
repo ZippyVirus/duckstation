@@ -67,7 +67,18 @@ class Client:
         req = urllib.request.Request(self.url, json.dumps(payload).encode(), headers)
         with http.open(req, timeout=5) as response:
             self.session = response.headers.get("MCP-Session-Id", self.session)
-            raw = response.read().decode()
+            if not notification and "text/event-stream" in response.headers.get("Content-Type", ""):
+                while True:
+                    line = response.readline().decode()
+                    if not line:
+                        raise ValueError("SSE response ended")
+                    if line.startswith("data:"):
+                        candidate = json.loads(line[5:].strip())
+                        if candidate.get("id") == payload.get("id"):
+                            raw = json.dumps(candidate)
+                            break
+            else:
+                raw = response.read().decode()
         if notification or not raw:
             return None
         if raw.startswith("event:") or raw.startswith("data:"):
