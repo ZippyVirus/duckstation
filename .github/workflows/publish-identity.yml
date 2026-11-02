@@ -20,6 +20,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           BUILD_RUN: ${{ inputs.run_id }}
         run: |
+          gh run watch "$BUILD_RUN" --exit-status --interval 10
           test "$(gh run view "$BUILD_RUN" --json conclusion -q .conclusion)" = success
           gh run download "$BUILD_RUN" --dir artifacts
       - name: Check independent Windows titles and identity lifecycle
