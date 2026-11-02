@@ -22,7 +22,13 @@ jobs:
         run: |
           gh run watch "$BUILD_RUN" --exit-status --interval 10
           test "$(gh run view "$BUILD_RUN" --json conclusion -q .conclusion)" = success
-          gh run download "$BUILD_RUN" --dir artifacts
+      - uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.run_id }}
+          path: artifacts
+          merge-multiple: true
+          skip-decompress: true
       - name: Check independent Windows titles and identity lifecycle
         shell: pwsh
         run: |
@@ -48,7 +54,13 @@ jobs:
           test "$(jq -r .conclusion build.json)" = success
           test "$(jq -r .workflowName build.json)" = "MCP Window Identity Windows Build"
           gh run download "$BUILD_RUN" --dir artifacts
-          find artifacts -type f
+      - uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.run_id }}
+          path: artifacts
+          merge-multiple: true
+          skip-decompress: true
       - name: Publish Windows x64 preview
         env:
           GH_TOKEN: ${{ github.token }}
