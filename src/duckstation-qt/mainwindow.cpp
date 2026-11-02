@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "mainwindow.h"
+#include "mcp_window_titles.h"
 #include "aboutdialog.h"
 #include "achievementlogindialog.h"
 #include "autoupdaterdialog.h"
@@ -192,6 +193,9 @@ MainWindow::MainWindow() : QMainWindow(nullptr)
 {
   Assert(!g_main_window);
   g_main_window = this;
+#ifdef ENABLE_MCP_SERVER
+  MCPWindowTitles::Install();
+#endif
   initialize();
 }
 

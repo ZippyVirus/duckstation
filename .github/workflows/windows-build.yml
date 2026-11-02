@@ -31,10 +31,6 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: Apply MCP window identity extension
-      shell: bash
-      run: git apply extras/mcp-window-identity/window-identity.patch
-
     - name: Download x64 Dependencies
       shell: bash
       run: |
@@ -89,6 +85,10 @@ jobs:
       shell: cmd
       run: |
         call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.vcvars }}
+        cl /nologo /std:c++17 /EHsc /W4 /WX /I src\core extras\mcp-window-identity\test_identity.cpp /Fe:identity-test.exe
+        if errorlevel 1 exit /b 1
+        identity-test.exe
+        if errorlevel 1 exit /b 1
         msbuild duckstation.sln -t:Build -p:Platform=${{ matrix.platform }};Configuration=${{ matrix.config }}
 
     - name: Create ${{ matrix.name }} Symbols Archive

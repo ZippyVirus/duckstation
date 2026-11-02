@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/types.h"
+#include "mcp_window_identity.h"
 
 #include <functional>
 #include <string_view>
@@ -26,6 +27,9 @@ void Shutdown();
 
 /// Returns true if the MCP server listen socket is active.
 bool IsActive();
+
+// Thread-safe UI snapshot, never reads socket state.
+WindowIdentity::Snapshot GetWindowIdentity();
 
 /// Polls the server's socket multiplexer. Called from the core thread's idle loop:
 /// upstream no longer keeps a shared multiplexer for the system to poll, so a server

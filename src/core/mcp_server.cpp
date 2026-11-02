@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "mcp_server.h"
+#include <cstdlib>
 #include "bus.h"
 #include "cdrom.h"
 #include "cpu_core.h"
@@ -104,6 +105,7 @@ static constexpr size_t MAX_SSE_CLIENTS = 4;
 
 /// Frontend callback for post-tool-call UI refresh.
 static StateChangedCallback s_state_changed_callback;
+static WindowIdentity s_window_identity;
 
 /// JSON-RPC 2.0 standard error codes (§5.1). Mirrored as named constants here so call
 /// sites read uniformly with the MCP-specific codes below rather than mixing literals.
@@ -400,6 +402,7 @@ static std::vector<std::string> s_mcp_temp_files;
 /// active input sequence, resource subscriptions, and log streaming state.
 static void ResetSessionState()
 {
+  s_window_identity.SetClient({});
   s_active_sequence.reset();
   s_subscribed_resources.clear();
   s_memory_scan.ResetSearch();
@@ -6959,8 +6962,42 @@ static ToolResult HandleWaitForPause([[maybe_unused]] const JsonValue& args)
   return ToolResult{w.TakeOutput()};
 }
 
+static ToolResult HandleMCPIdentity(const JsonValue& args)
+{
+  const std::string action = args.contains("action") && args["action"].is_string()
+    ? std::string(args["action"].get_string()) : "get";
+  if (action == "set")
+  {
+    if (!args.contains("owner") || !args["owner"].is_string() ||
+        WindowIdentity::Clean(args["owner"].get_string()).empty())
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "A nonempty printable owner label is required");
+    if (args.contains("task") && !args["task"].is_string())
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "task must be a string");
+    s_window_identity.SetOwner(args["owner"].get_string(),
+      args.contains("task") ? args["task"].get_string() : std::string_view());
+  }
+  else if (action == "clear")
+    s_window_identity.SetOwner({}, {});
+  else if (action != "get")
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "action must be get, set, or clear");
+
+  const auto identity = s_window_identity.Get();
+  JsonWriter w;
+  w.StartObject();
+  w.KeyUint("port", identity.port);
+  w.KeyString("owner", identity.owner);
+  w.KeyString("task", identity.task);
+  w.KeyString("client", identity.client);
+  w.KeyString("title_suffix", identity.Suffix());
+  w.KeyString("ownership_semantics", "Declared instance assignment, not an access-control lock");
+  w.EndObject();
+  return ToolResult{w.TakeOutput()};
+}
+
 static ToolResult DispatchToolCall(const std::string& tool_name, const JsonValue& args)
 {
+  if (tool_name == "mcp_identity")
+    return HandleMCPIdentity(args);
   if (tool_name == "read_registers")
     return HandleReadRegisters(args);
   else if (tool_name == "write_register")
@@ -7816,6 +7853,9 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     ResetSessionState();
 
     // Generate a new crypto-secure session ID.
+    if (params.contains("clientInfo") && params["clientInfo"].is_object() &&
+        params["clientInfo"].contains("name") && params["clientInfo"]["name"].is_string())
+      s_window_identity.SetClient(params["clientInfo"]["name"].get_string());
     s_mcp_session_id = GenerateSessionId();
     s_negotiated_protocol_version = negotiated_version;
     INFO_LOG("MCP session initialized: id={}, protocol={}", s_mcp_session_id, negotiated_version);
@@ -7851,6 +7891,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     // clang-format off
     // Static tool definitions as raw JSON.
     static constexpr const char TOOLS_JSON[] = R"json({"tools":[
+{"name":"mcp_identity","description":"Get or declare this emulator instance owner (LLM) and task. Call action=set only on your assigned endpoint. Labels are advisory, not locks. Owner persists across HTTP sessions until cleared or the server restarts. Client name is separately reported from initialize.clientInfo. For stateless MCP use this tool to declare the owner.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["get","set","clear"],"default":"get"},"owner":{"type":"string","description":"Explicit LLM/client assignment, e.g. Codex or Claude"},"task":{"type":"string","description":"Task label, e.g. widescreen or Heat port"}}},"title":"MCP Instance Identity","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"read_registers","description":"Read CPU registers (GPR, COP0, GTE). Returns: JSON object with register names as keys and hex string values (e.g. {\"v0\":\"0x00000001\", \"sp\":\"0x801FFF00\", ...}).","inputSchema":{"type":"object","properties":{"group":{"type":"string","enum":["gpr","cop0","gte","all"],"default":"all","description":"Register group to read"}}},"title":"Read Registers","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"write_register","description":"Write a value to a CPU register by name. Returns: {register, value} confirming the written value.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Register name (e.g. 'v0', 'sp', 'pc', 'COP0_SR')"},"value":{"description":"Value to write (integer or hex string like '0x80010000')"}},"required":["name","value"]},"title":"Write Register","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
 {"name":"disassemble","description":"Disassemble MIPS instructions at a given address. Returns: JSON array of {address, bytes, instruction, comment} objects, one per instruction.","inputSchema":{"type":"object","properties":{"address":{"description":"Start address (integer or hex string)"},"count":{"type":"integer","default":20,"description":"Number of instructions to disassemble"}},"required":["address"]},"title":"Disassemble","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
@@ -8996,6 +9037,11 @@ void MCPServer::ClientSocket::OnSystemResumed()
 
 bool MCPServer::Initialize(u16 port, std::string_view auth_token, std::string_view cors_origin)
 {
+  if (port == 0)
+  {
+    ERROR_LOG("MCP requires an explicit nonzero port");
+    return false;
+  }
   s_auth_token = std::string(auth_token);
   s_cors_origin = cors_origin.empty() ? std::string("*") : std::string(cors_origin);
 
@@ -9024,8 +9070,16 @@ bool MCPServer::Initialize(u16 port, std::string_view auth_token, std::string_vi
     return false;
   }
 
+  const char* owner = std::getenv("DUCKSTATION_MCP_OWNER");
+  const char* task = std::getenv("DUCKSTATION_MCP_TASK");
+  s_window_identity.Start(port, owner ? owner : "", task ? task : "");
   INFO_LOG("MCP server is now listening on {}.", address->ToString());
   return true;
+}
+
+WindowIdentity::Snapshot MCPServer::GetWindowIdentity()
+{
+  return s_window_identity.Get();
 }
 
 bool MCPServer::IsActive()
@@ -9035,6 +9089,7 @@ bool MCPServer::IsActive()
 
 void MCPServer::Shutdown()
 {
+  s_window_identity.Stop();
   if (!s_mcp_listen_socket)
     return;
 
