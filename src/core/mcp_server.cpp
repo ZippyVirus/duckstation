@@ -9077,7 +9077,7 @@ bool MCPServer::Initialize(u16 port, std::string_view auth_token, std::string_vi
   return true;
 }
 
-WindowIdentity::Snapshot MCPServer::GetWindowIdentity()
+MCPServer::WindowIdentity::Snapshot MCPServer::GetWindowIdentity()
 {
   return s_window_identity.Get();
 }

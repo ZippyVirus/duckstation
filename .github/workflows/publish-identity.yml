@@ -9,7 +9,32 @@ permissions:
   actions: read
   contents: write
 jobs:
+  native-ui:
+    runs-on: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download successful build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_RUN: ${{ inputs.run_id }}
+        run: |
+          test "$(gh run view "$BUILD_RUN" --json conclusion -q .conclusion)" = success
+          gh run download "$BUILD_RUN" --dir artifacts
+      - name: Check independent Windows titles and identity lifecycle
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem artifacts -Recurse -Filter duckstation-windows-x64-release.zip | Select-Object -First 1
+          if (-not $zip) { throw 'Missing Windows binary' }
+          python extras/mcp-window-identity/windows_ui_smoke.py $zip.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v7
+        with:
+          path: native-ui-smoke.json
+          if-no-files-found: error
   publish:
+    needs: native-ui
     runs-on: ubuntu-latest
     steps:
       - name: Verify successful build and download artifacts
@@ -32,5 +57,5 @@ jobs:
           TAG="mcp-window-identity-${SHA:0:8}"
           ZIP=$(find artifacts -type f -name duckstation-windows-x64-release.zip -print -quit)
           test -n "$ZIP"
-          printf '%s\n' 'Native MCP port, owner/task and client identity in all top-level Qt window titles.' '' 'Built from the referenced commit. Native identity lifecycle and concurrency checks run in CI. This preview has not yet completed local visual/runtime acceptance. Owner labels are declared assignments, not locks.' > notes.md
+          printf '%s\n' 'Native MCP port, owner/task and client identity in all top-level Qt window titles.' '' 'Built from the referenced commit. Native identity lifecycle and concurrency checks run in CI. Two isolated native Windows instances passed automated UI identity acceptance. Local gameplay and detached/dialog window acceptance remain outstanding. Owner labels are declared assignments, not locks.' > notes.md
           gh release create "$TAG" "$ZIP" --target "$SHA" --prerelease --title "MCP window identity preview" --notes-file notes.md
